@@ -277,3 +277,130 @@ async fn unloading_a_row_withdraws_its_services_without_waiting_for_the_runtime(
     process.dispose().await.unwrap();
     ctx.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn service_handles_keep_their_object_across_reload_and_update() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("review_plugin.py"),
+        r#"
+class Review:
+    def __init__(self, value): self.value = value
+    def read(self): return self.value
+    def other(self): return self.value
+provides = {"review": Review}
+def apply(ctx, config): ctx.provide("review", Review(config["value"]))
+"#,
+    )
+    .unwrap();
+    let process = python(dir.path()).await;
+    let entry = "review_plugin";
+    let exports = json!({ "review": { "read": "sync", "value": "sync" } });
+    process
+        .call_async(
+            "",
+            "rows.load",
+            json!(["row", entry, {"value": "old"}, [], [], exports]),
+        )
+        .await
+        .unwrap();
+    eventually(
+        || process.service("review").is_some(),
+        "the original handle",
+    )
+    .await;
+    let old = process.service("review").unwrap();
+    assert_eq!(
+        process.call_async(&old, "read", json!([])).await.unwrap(),
+        json!("old")
+    );
+    process
+        .call_async("", "rows.unload", json!(["row"]))
+        .await
+        .unwrap();
+    // The retained handle and its declared methods survive the slot itself.
+    assert_eq!(
+        process.call_async(&old, "read", json!([])).await.unwrap(),
+        json!("old")
+    );
+    assert_eq!(
+        process
+            .call_async("", "get", json!([old, "value"]))
+            .await
+            .unwrap(),
+        json!("old")
+    );
+    let replacement_exports = json!({ "review": { "other": "sync", "value": "sync" } });
+    process
+        .call_async(
+            "",
+            "rows.load",
+            json!(["row", entry, {"value": "new"}, [], [], replacement_exports]),
+        )
+        .await
+        .unwrap();
+    eventually(
+        || {
+            process
+                .service("review")
+                .is_some_and(|handle| handle != old)
+        },
+        "a distinct replacement handle",
+    )
+    .await;
+    let new = process.service("review").unwrap();
+    assert_ne!(old, new);
+    assert_eq!(
+        process.call_async(&old, "read", json!([])).await.unwrap(),
+        json!("old")
+    );
+    assert!(process.call_async(&old, "other", json!([])).await.is_err());
+    assert!(process.call_async(&new, "read", json!([])).await.is_err());
+    assert_eq!(
+        process
+            .call_async("", "get", json!([old, "value"]))
+            .await
+            .unwrap(),
+        json!("old")
+    );
+    process
+        .call_async("", "release", json!([old]))
+        .await
+        .unwrap();
+    assert!(process.call_async(&old, "read", json!([])).await.is_err());
+    assert_eq!(
+        process.call_async(&new, "other", json!([])).await.unwrap(),
+        json!("new")
+    );
+    process
+        .call_async("", "rows.update", json!(["row", {"value": "updated"}]))
+        .await
+        .unwrap();
+    eventually(
+        || {
+            process
+                .service("review")
+                .is_some_and(|handle| handle != new)
+        },
+        "the updated handle",
+    )
+    .await;
+    let updated = process.service("review").unwrap();
+    assert_ne!(updated, old);
+    assert_eq!(
+        process.call_async(&new, "other", json!([])).await.unwrap(),
+        json!("new")
+    );
+    process
+        .call_async("", "release", json!([new]))
+        .await
+        .unwrap();
+    assert_eq!(
+        process
+            .call_async(&updated, "other", json!([]))
+            .await
+            .unwrap(),
+        json!("updated")
+    );
+    process.dispose().await.unwrap();
+}

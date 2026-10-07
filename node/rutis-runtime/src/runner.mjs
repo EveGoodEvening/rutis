@@ -54,9 +54,10 @@ const FEATURES = ['rows.v2', 'hosts', 'leaf.js']
 // Each exported service slot is projected as a sequence of object handles.
 // A handle always addresses the object it was created for; when the slot
 // changes, the Rust side receives a new handle and replaces its native proxy.
-// The first object of a slot uses the service name as its handle.
-const slots = new Map() // name -> { methods, scope, object, identity, handle, generation, exporter }
-const handles = new Map() // handle -> { name, object, current, released }
+// The first object of a service in this session uses its name as its handle.
+const slots = new Map() // name -> { methods, scope, object, identity, handle, exporter }
+const handles = new Map() // handle -> { name, object, methods, current, released }
+const generations = new Map() // name -> generation; survives slot withdrawal
 
 // Cordis wraps Service instances in a new tracing proxy on every read; the
 // proxy reports its target under this symbol. Compare targets, not wrappers.
@@ -114,9 +115,10 @@ function refresh() {
     slot.identity = current
     slot.handle = null
     if (object !== undefined) {
-      slot.generation++
-      slot.handle = slot.generation === 1 ? name : `${name}#${slot.generation}`
-      handles.set(slot.handle, { name, object, current: true, released: false })
+      const generation = (generations.get(name) ?? 0) + 1
+      generations.set(name, generation)
+      slot.handle = generation === 1 ? name : `${name}#${generation}`
+      handles.set(slot.handle, { name, object, methods: slot.methods, current: true, released: false })
     }
     slot.version = ++version
     if (mounted && !closing) {
@@ -223,7 +225,7 @@ async function loadRow([key, entry, config, isolate, inject, exports]) {
   // The row's services are read from its own scope, like a consumer of it
   // would, so an isolated row exports the service of its isolated scope.
   for (const name of names) {
-    const slot = { methods: new Set(Object.keys(exports[name] ?? {})), scope: undefined, object: undefined, identity: undefined, handle: null, generation: 0, version: 0 }
+    const slot = { methods: new Set(Object.keys(exports[name] ?? {})), scope: undefined, object: undefined, identity: undefined, handle: null, version: 0 }
     slots.set(name, slot)
     slot.exporter = exporter(name, slot, scope)
   }
@@ -359,7 +361,7 @@ function mount(args) {
   fibers = []
   for (const [name, methods] of Object.entries(args.services ?? {})) {
     if (name.includes('#')) throw new Error(`service name ${name} cannot be projected`)
-    slots.set(name, { methods: new Set(methods), scope: undefined, object: undefined, identity: undefined, handle: null, generation: 0, version: 0 })
+    slots.set(name, { methods: new Set(methods), scope: undefined, object: undefined, identity: undefined, handle: null, version: 0 })
   }
   const plugins = args.plugins ?? [{ entry: pluginPath, config: args.config }]
   emits = new Set(args.emits ?? [])
@@ -420,7 +422,7 @@ function dispatch(target, method, args) {
         const [handle, property] = args ?? []
         const entry = handles.get(handle)
         if (!entry) throw new Error(`unknown or released service object ${handle}`)
-        if (!slots.get(entry.name).methods.has(property)) throw new Error(`unknown service property ${entry.name}.${property}`)
+        if (!entry.methods.has(property)) throw new Error(`unknown service property ${entry.name}.${property}`)
         return entry.object[property]
       }
       case 'rows.load': return loadRow(args ?? [])
@@ -450,7 +452,7 @@ function dispatch(target, method, args) {
   }
   const entry = handles.get(target)
   if (!entry) throw new Error(`unknown or released service object ${target}`)
-  if (!slots.get(entry.name).methods.has(method)) throw new Error(`unknown service method ${entry.name}.${method}`)
+  if (!entry.methods.has(method)) throw new Error(`unknown service method ${entry.name}.${method}`)
   if (!Array.isArray(args)) throw new TypeError('method arguments must be an array')
   let result
   try {

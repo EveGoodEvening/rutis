@@ -91,6 +91,8 @@ The runtime-process/rutis contract is the current Node runtime implementation wi
 | Services | In row mode, row-provided services are not projected into Rust (`InteropResolver` today) | Runtime reports row-provided services through existing service-slot notification. rutis registers by name under `TypeKey::keyed_dynamic::<RemoteService>(name)` and records them in the loader's service-name catalog. |
 | Method shape | Only build-generated mounts know sync vs async | Report sync/async method shape with each service at runtime: Python uses `inspect`; Swift declares it in SDK registration. Node approach in §9. |
 
+A service slot may be withdrawn, reloaded, or replaced by a configuration update, but its handle generation increases per service name throughout the session and is not reset when the slot is deleted. Each handle retains its original object and method declarations until released; releasing an old handle does not affect the newer object of the same service.
+
 Call directions:
 
 - **A plugin in another language calls a rutis or other-language service:** use existing `host:<name>` calls. At call time, rutis looks up the current provider by name and forwards if it belongs to another runtime. Routing is dynamic; the runtime need not have those services at startup:

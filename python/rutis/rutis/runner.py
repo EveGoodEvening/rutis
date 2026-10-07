@@ -74,7 +74,6 @@ class Slot:
     methods: set
     object: Any = None
     handle: str | None = None
-    generation: int = 0
 
 
 @dataclass
@@ -110,6 +109,7 @@ class Runtime:
         self.hosts: dict[str, HostProxy] = {}
         self.slots: dict[str, Slot] = {}
         self.handles: dict[str, dict] = {}
+        self.generations: dict[str, int] = {}  # survives slot withdrawal
         self.version = 0
         self.closing = False
         # The source file of each plugin module when it was imported.
@@ -154,9 +154,10 @@ class Runtime:
         slot.object = current
         slot.handle = None
         if current is not None:
-            slot.generation += 1
-            slot.handle = name if slot.generation == 1 else f"{name}#{slot.generation}"
-            self.handles[slot.handle] = {"name": name, "object": current, "current": True, "released": False}
+            generation = self.generations.get(name, 0) + 1
+            self.generations[name] = generation
+            slot.handle = name if generation == 1 else f"{name}#{generation}"
+            self.handles[slot.handle] = {"name": name, "object": current, "methods": slot.methods, "current": True, "released": False}
         self.version += 1
         if self.peer is not None and not self.closing:
             self.peer.notify("", "service", [name, slot.handle, self.version])
@@ -271,8 +272,7 @@ class Runtime:
         entry = self.handles.get(target)
         if entry is None:
             raise LookupError(f"unknown or released service object {target}")
-        slot = self.slots.get(entry["name"])
-        if slot is not None and method not in slot.methods:
+        if method not in entry["methods"]:
             raise AttributeError(f"unknown service method {entry['name']}.{method}")
         if not isinstance(args, list):
             raise TypeError("method arguments must be an array")
