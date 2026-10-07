@@ -102,7 +102,7 @@ uv run rutis-host dev
 
 The row with the same ID as the plugin supplies its configuration; the other rows are additional plugins. They may also be TypeScript plugins (in that case, add `"runtimes": { "node": { "project": "." } }` to `rutis.dev.json`). `uv run rutis-host check` lists each row's dependencies, provided services, and configuration schema, and exits with a nonzero status if there is a problem.
 
-Only the plugin module itself is reimported. If another imported module changes, restart `rutis-host dev`.
+When plugin source changes, the runtime compiles the new source without reusing its old bytecode cache, including same-size edits within one second. Only the plugin module itself is re-executed. If another imported module changes, restart `rutis-host dev`.
 
 ## 5. Publish
 

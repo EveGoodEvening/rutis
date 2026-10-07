@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import importlib.metadata
+import importlib.machinery
 import inspect
 import os
 import sys
@@ -241,7 +242,16 @@ class Runtime:
             module = importlib.import_module(name)
         elif name in self.stamps and _stamp(module) != self.stamps[name]:
             importlib.invalidate_caches()
-            module = importlib.reload(module)
+            loader = module.__spec__.loader
+            if isinstance(loader, importlib.machinery.SourceFileLoader):
+                # Timestamp pycs only record whole seconds and source size.
+                # Compile the changed source directly, without reading or writing
+                # its bytecode cache (which may be missing or read-only).
+                path = loader.get_filename(name)
+                code = loader.source_to_code(loader.get_data(path), path)
+                exec(code, module.__dict__)
+            else:
+                module = importlib.reload(module)
         self.stamps[name] = _stamp(module)
         return module
 

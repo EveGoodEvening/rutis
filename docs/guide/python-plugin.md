@@ -102,7 +102,7 @@ uv run rutis-host dev
 
 和插件 id 相同的那一行给插件本身加配置；其他行是一起运行的插件，也可以是 TypeScript 插件（这时 `rutis.dev.json` 里要加 `"runtimes": { "node": { "project": "." } }`）。`uv run rutis-host check` 列出每一行的依赖、提供的服务和配置 Schema，有问题时以非零状态退出。
 
-只重新导入插件模块本身；它导入的其他模块改了，要重启 `rutis-host dev`。
+检测到插件源码变化后，运行时直接编译新源码，不复用旧字节码缓存；同一秒内的等长修改也会生效。只重新执行插件模块本身；它导入的其他模块改了，要重启 `rutis-host dev`。
 
 ## 5. 发布
 
