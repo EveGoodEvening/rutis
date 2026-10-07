@@ -1618,6 +1618,133 @@ async fn single_service_evict() {
 
 // ── cancel(D27)───────────────────────────────────────────────────
 
+#[tokio::test(flavor = "current_thread")]
+async fn dispose_before_first_load_does_not_admit_a_generation() {
+    let root = Ctx::root().unwrap();
+    let applied = Arc::new(AtomicUsize::new(0));
+    let rescue = Arc::new(tokio::sync::Notify::new());
+    let view = root.plugin(simple("dispose-before-load", {
+        let applied = applied.clone();
+        let rescue = rescue.clone();
+        move |ctx: &Ctx| {
+            let applied = applied.clone();
+            let rescue = rescue.clone();
+            Box::pin(async move {
+                applied.fetch_add(1, Ordering::SeqCst);
+                tokio::select! {
+                    _ = ctx.cancelled() => {},
+                    _ = rescue.notified() => {},
+                }
+                Ok(Effect::Done)
+            })
+        }
+    }));
+    // No yield: RefreshDeps is queued, but the driver has not started load.
+    let disposed = tokio::time::timeout(Duration::from_millis(250), view.dispose()).await;
+    // Release a broken implementation's apply before asserting, so no driver
+    // waiting forever on cancellation survives this regression test.
+    rescue.notify_one();
+    soon(view.dispose()).await.unwrap();
+    disposed
+        .expect("dispose before load must complete")
+        .unwrap();
+    assert_eq!(view.state().state, FiberState::Disposed);
+    assert_eq!(view.state().generation, 0);
+    assert_eq!(applied.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dispose_after_load_admission_cancels_the_installed_token() {
+    let root = Ctx::root().unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let rescue = Arc::new(tokio::sync::Notify::new());
+    let cancelled = Arc::new(AtomicUsize::new(0));
+    let view = root.plugin(simple("dispose-admitted-load", {
+        let started = started.clone();
+        let rescue = rescue.clone();
+        let cancelled = cancelled.clone();
+        move |ctx: &Ctx| {
+            let started = started.clone();
+            let rescue = rescue.clone();
+            let cancelled = cancelled.clone();
+            Box::pin(async move {
+                started.notify_one();
+                tokio::select! {
+                    _ = ctx.cancelled() => {
+                        cancelled.fetch_add(1, Ordering::SeqCst);
+                    },
+                    _ = rescue.notified() => {},
+                }
+                Ok(Effect::Done)
+            })
+        }
+    }));
+    soon(started.notified()).await;
+    assert_eq!(view.state().generation, 1);
+    let disposed = tokio::time::timeout(Duration::from_millis(250), view.dispose()).await;
+    rescue.notify_one();
+    soon(view.dispose()).await.unwrap();
+    disposed
+        .expect("dispose must cancel the admitted load")
+        .unwrap();
+    assert_eq!(cancelled.load(Ordering::SeqCst), 1);
+    assert_eq!(view.state().state, FiberState::Disposed);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dispose_during_restart_cleanup_forbids_the_next_generation() {
+    let root = Ctx::root().unwrap();
+    let applied = Arc::new(AtomicUsize::new(0));
+    let cleaning = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let rescue = Arc::new(tokio::sync::Notify::new());
+    let view = root.plugin(simple("dispose-restart-boundary", {
+        let applied = applied.clone();
+        let cleaning = cleaning.clone();
+        let release = release.clone();
+        let rescue = rescue.clone();
+        move |ctx: &Ctx| {
+            let applied = applied.clone();
+            let cleaning = cleaning.clone();
+            let release = release.clone();
+            let rescue = rescue.clone();
+            Box::pin(async move {
+                if applied.fetch_add(1, Ordering::SeqCst) != 0 {
+                    tokio::select! {
+                        _ = ctx.cancelled() => {},
+                        _ = rescue.notified() => {},
+                    }
+                    return Ok(Effect::Done);
+                }
+                Ok(Effect::AsyncDisposer(Box::new(move || {
+                    Box::pin(async move {
+                        cleaning.notify_one();
+                        release.notified().await;
+                        Ok(())
+                    })
+                })))
+            })
+        }
+    }));
+    soon(async { (&view).await }).await.unwrap();
+    let generation = view.state().generation;
+    let restart = tokio::spawn(view.restart());
+    soon(cleaning.notified()).await;
+    // Register the terminal request while restart's old generation drains.
+    let dispose = view.dispose();
+    release.notify_one();
+    let disposed = tokio::time::timeout(Duration::from_millis(250), dispose).await;
+    rescue.notify_one();
+    soon(view.dispose()).await.unwrap();
+    soon(restart).await.unwrap().unwrap();
+    disposed
+        .expect("dispose must prevent restart admission")
+        .unwrap();
+    assert_eq!(view.state().state, FiberState::Disposed);
+    assert_eq!(view.state().generation, generation);
+    assert_eq!(applied.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn cancel_wakes_awaiters() {
     let ctx = Ctx::root().unwrap();

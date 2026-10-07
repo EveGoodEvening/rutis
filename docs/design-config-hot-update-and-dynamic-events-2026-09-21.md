@@ -104,7 +104,7 @@ impl FiberView {
 | 场景 | 收敛 |
 |---|---|
 | update × update | mailbox FIFO,后者覆盖 config;两个 join 各自等到自己的 Restart 处理完 |
-| update × dispose | terminal_task 先登记则 update 拒绝;反之 dispose 排队等 restart 完成后卸载 |
+| update × dispose | terminal_task 先登记则 update 拒绝；update 先登记时，dispose 仍阻止 restart 尚未准入的新代，并取消已准入代的 token，等待旧代清理后完成卸载 |
 | update × 驱逐(RefreshDepsJoin) | mailbox 序决定先后;两者都收敛到"用当前 config 重载",无竞态窗口 |
 | update × 运行中 apply | cancel_current 协作退出(与 restart 现有语义一致,D27 限制照旧:不观察 token 的 apply 无限等待) |
 

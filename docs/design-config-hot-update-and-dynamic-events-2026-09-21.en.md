@@ -106,7 +106,7 @@ impl FiberView {
 | Scenario | Convergence |
 |---|---|
 | update × update | Mailbox FIFO; later update overwrites config. Each join waits until its own Restart has been processed |
-| update × dispose | If terminal_task is registered first, update rejects; otherwise dispose queues behind restart and unloads afterward |
+| update × dispose | If terminal_task is registered first, update rejects. If update was registered first, disposal still prevents an unadmitted restart generation, cancels any already-admitted generation's token, and waits for old-generation cleanup before completing |
 | update × eviction (`RefreshDepsJoin`) | Mailbox order decides which runs first; both converge to reload using current config, with no race window |
 | update × apply in progress | `cancel_current()` requests cooperative exit (same as existing restart semantics; D27 remains: apply that ignores token can wait forever) |
 

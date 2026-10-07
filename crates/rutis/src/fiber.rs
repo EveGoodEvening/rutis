@@ -545,15 +545,21 @@ impl FiberInner {
         if this.closing.load(Ordering::SeqCst) || shared.closing.load(Ordering::SeqCst) {
             return;
         }
-        this.new_generation_token();
-        this.accesses.lock().unwrap().clear();
         let generation = {
             let mut tr = this.transition.lock().unwrap();
+            // Dispose registration and generation admission share this lock.
+            // Either disposal forbids the new generation, or its cancellation
+            // sees the token installed here (transition -> token lock order).
+            if tr.terminal_task.is_some() {
+                return;
+            }
+            this.new_generation_token();
             tr.generation += 1;
             tr.error = None;
             Self::set_state(this, &mut tr, FiberState::Loading);
             tr.generation
         };
+        this.accesses.lock().unwrap().clear();
         this.flush_status();
         drop(_admission);
 
