@@ -480,6 +480,157 @@ fn heartbeats_find_a_half_open_connection() {
     assert!(started.elapsed() < Duration::from_secs(3));
 }
 
+/// Keep the real TCP peer alive but stop reading after the handshake. Its
+/// small receive window makes one bounded 8 MiB frame stall the writer.
+async fn stalled_writer(explicit_close: bool) {
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+    let listener = tokio::net::TcpListener::bind(loopback()).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let transport = client(Limits {
+        ping: Duration::from_millis(50),
+        timeout: if explicit_close {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_millis(500)
+        },
+        max_message: 8 * 1024 * 1024,
+        ..Limits::default()
+    });
+    let handshake = async {
+        let (tcp, _) = listener.accept().await.unwrap();
+        socket2::SockRef::from(&tcp)
+            .set_recv_buffer_size(4096)
+            .unwrap();
+        tokio_tungstenite::accept_hdr_async(tcp, |_: &Request, mut response: Response| {
+            response
+                .headers_mut()
+                .insert("Sec-WebSocket-Protocol", PROTOCOL.parse().unwrap());
+            Ok(response)
+        })
+        .await
+        .unwrap()
+    };
+    let dial = dial_as(format!("ws://{addr}/rutis"), "mac", "mac-token");
+    let (socket, channel) = tokio::join!(handshake, transport.dial(&dial));
+    let mut channel = channel.unwrap();
+    let closer = channel.closer.clone();
+    channel.sender.send(&vec![b'x'; 8 * 1024 * 1024]).unwrap();
+    let (result_tx, result_rx) = mpsc::channel();
+    let receiver = std::thread::spawn(move || {
+        let _ = result_tx.send(channel.receiver.recv());
+    });
+    // RAII ends the blocked receiver and socket even if an assertion fails.
+    struct Cleanup {
+        closer: Arc<dyn rutis_bridge::channel::Closer>,
+        receiver: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.closer.close("test cleanup");
+            if let Some(receiver) = self.receiver.take() {
+                receiver.join().unwrap();
+            }
+        }
+    }
+    let _cleanup = Cleanup {
+        closer: closer.clone(),
+        receiver: Some(receiver),
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(matches!(
+        result_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    let started = std::time::Instant::now();
+    if explicit_close {
+        closer.close("explicit close under backpressure");
+    }
+    let ended = result_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let expected = if explicit_close {
+        "explicit close under backpressure"
+    } else {
+        "heartbeat timeout"
+    };
+    assert!(
+        matches!(&ended, Err(rutis_bridge::channel::ChannelError::Closed { reason }) if reason.contains(expected)),
+        "{ended:?}"
+    );
+    // Pipe closure alone is insufficient: the physical connection task must
+    // finish rather than spend the entire wait limit in a blocked send/close.
+    transport.closed(Duration::from_secs(2)).await;
+    assert!(started.elapsed() < Duration::from_secs(1));
+    drop(socket);
+}
+
+#[tokio::test]
+async fn heartbeat_deadline_survives_socket_write_backpressure() {
+    stalled_writer(false).await;
+}
+
+#[tokio::test]
+async fn explicit_close_interrupts_socket_write_backpressure() {
+    stalled_writer(true).await;
+}
+
+#[test]
+fn local_receiver_backpressure_pauses_silence_but_not_explicit_close() {
+    let limits = Limits {
+        buffer: 1,
+        ping: Duration::from_millis(100),
+        timeout: Duration::from_millis(400),
+        ..Limits::default()
+    };
+    for close_while_paused in [false, true] {
+        let server = server(limits.clone());
+        let client = client(limits.clone());
+        let (mut dialed, mut accepted, _registered) = connected(&server, &client);
+        dialed.sender.send(b"a").unwrap();
+        dialed.sender.send(b"b").unwrap();
+        // The first byte fills the pipe; the second blocks the reader.
+        // Allow several complete silence periods, not a deadline-edge race.
+        std::thread::sleep(Duration::from_millis(1600));
+        accepted
+            .sender
+            .send(b"alive")
+            .expect("local backpressure is not peer silence");
+        let closer = accepted.closer.clone();
+        if close_while_paused {
+            let started = std::time::Instant::now();
+            closer.close("close while inbound paused");
+            block_on(server.closed(Duration::from_secs(2)));
+            assert!(started.elapsed() < Duration::from_secs(1));
+        } else {
+            let (tx, rx) = mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let first = accepted.receiver.recv();
+                let second = accepted.receiver.recv();
+                let _ = tx.send((first, second));
+            });
+            struct Cleanup {
+                closer: Arc<dyn rutis_bridge::channel::Closer>,
+                reader: Option<std::thread::JoinHandle<()>>,
+            }
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    self.closer.close("test cleanup");
+                    self.reader.take().unwrap().join().unwrap();
+                }
+            }
+            let _cleanup = Cleanup {
+                closer,
+                reader: Some(reader),
+            };
+            let (first, second) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(first.unwrap().unwrap(), b"a");
+            assert_eq!(second.unwrap().unwrap(), b"b");
+            // Draining capacity resumes socket reads and healthy heartbeats.
+            std::thread::sleep(Duration::from_millis(800));
+            accepted.sender.send(b"resumed").unwrap();
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_plugin_provides_the_transport_and_unloading_closes_everything() {
     let plugin = WebSocketPlugin::new(Config::new().listener(ListenerConfig::new(

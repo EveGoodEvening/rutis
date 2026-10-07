@@ -224,6 +224,8 @@ The following applies only to WebSocket transport and is shared across language 
 
 Deployment config determines dial direction between full framework nodes. A remote leaf runtime only listens and is dialed by controller link, because the leaf has no link to own reconnect backoff (see “Remote Lease” in remote design). Direction does not grant feature permissions. Heartbeat uses WebSocket ping/pong, not session-protocol frames.
 
+In the Rust transport, socket-write backpressure does not pause the silence deadline, and explicit close does not wait for a blocked write or flush. Intentional inbound backpressure from a full local receive queue pauses silence detection and restarts it when capacity returns; this is not peer loss. On termination, a close frame or acknowledgement is sent only if the socket is immediately writable; otherwise the physical connection is dropped so a slow-reading peer cannot retain the connection task.
+
 ## Local Subprocess Endpoints and Compatibility Interfaces
 
 - `Session` exposes session mechanics through `Connection`; endpoint contracts wrap operations and can use any `Channel`. Leaf runtimes do not need node-bridge operations.

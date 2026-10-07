@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::channel::{Channel, ChannelError, ChannelInfo, Closer, Receiver, Sender};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -193,77 +193,119 @@ async fn run<S: Io>(
     timeout: Duration,
 ) {
     let (mut sink, mut stream) = socket.split();
-    let mut ticker = tokio::time::interval_at(Instant::now() + ping, ping);
-    let mut last_seen = Instant::now();
-    let ending = loop {
-        tokio::select! {
-            (code, reason) = shared.control.requested() => {
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(1),
-                    sink.send(close_frame(code, &reason)),
-                ).await;
-                break Ending::Failed(reason);
-            }
-            message = shared.outgoing.pop() => {
-                let Some(message) = message else { continue };
-                let text = match String::from_utf8(message) {
-                    Ok(text) => text,
-                    Err(_) => {
-                        let reason = "a message is not UTF-8 text";
-                        let _ = sink.send(close_frame(1007, reason)).await;
-                        break Ending::Failed(reason.into());
+    let (activity, mut seen) = tokio::sync::watch::channel(Some(Instant::now()));
+    let flush = Notify::new();
+    // Socket writes may wait indefinitely, but cannot own the connection's
+    // lifetime. Intentional inbound backpressure pauses silence checks;
+    // control always remains independently interruptible.
+    let (ending, close) = {
+        let writer = async {
+            let mut ticker = tokio::time::interval_at(Instant::now() + ping, ping);
+            loop {
+                tokio::select! {
+                    message = shared.outgoing.pop() => {
+                        let Some(message) = message else { continue };
+                        let text = match String::from_utf8(message) {
+                            Ok(text) => text,
+                            Err(_) => {
+                                let reason = "a message is not UTF-8 text";
+                                return (Ending::Failed(reason.into()), Some(close_frame(1007, reason)));
+                            }
+                        };
+                        if let Err(error) = sink.send(Message::Text(text.into())).await {
+                            return (Ending::Failed(format!("send failed: {error}")), None);
+                        }
                     }
-                };
-                if let Err(error) = sink.send(Message::Text(text.into())).await {
-                    break Ending::Failed(format!("send failed: {error}"));
+                    _ = flush.notified() => {
+                        if let Err(error) = sink.flush().await {
+                            return (Ending::Failed(format!("send failed: {error}")), None);
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
+                            return (Ending::Failed("connection lost".into()), None);
+                        }
+                    }
                 }
             }
-            frame = stream.next() => {
-                last_seen = Instant::now();
+        };
+        let reader = async {
+            loop {
+                let frame = stream.next().await;
+                activity.send_replace(Some(Instant::now()));
                 match frame {
                     Some(Ok(Message::Text(text))) => {
-                        // Waits while the receiver lags: reading stops, and
-                        // TCP pushes back on the far end.
-                        if !shared.incoming.push(text.as_bytes().to_vec()).await {
-                            continue;
-                        }
-                        last_seen = Instant::now();
+                        // At most one incoming message waits outside the bounded pipe.
+                        // A local consumer, not a silent peer, stopped reads.
+                        activity.send_replace(None);
+                        shared.incoming.push(text.as_bytes().to_vec()).await;
+                        activity.send_replace(Some(Instant::now()));
                     }
                     Some(Ok(Message::Binary(_))) => {
                         let reason = "binary messages are reserved for a binary encoding";
-                        let _ = sink.send(close_frame(1003, reason)).await;
-                        break Ending::Failed(reason.into());
+                        return (
+                            Ending::Failed(reason.into()),
+                            Some(close_frame(1003, reason)),
+                        );
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {
-                        // Answers to pings are queued by the protocol; flush them.
-                        let _ = sink.flush().await;
+                        // Tungstenite queues automatic pong replies on the shared socket.
+                        flush.notify_one();
                     }
                     Some(Ok(Message::Close(frame))) => {
-                        let _ = sink.close().await;
-                        break far_close(frame);
+                        return (far_close(frame), None);
                     }
                     Some(Err(WsError::Capacity(error))) => {
                         let reason = format!("received a message over the limit: {error}");
-                        let _ = sink.send(close_frame(TOO_BIG, &reason)).await;
-                        break Ending::Failed(reason);
+                        let close = close_frame(TOO_BIG, &reason);
+                        return (Ending::Failed(reason), Some(close));
                     }
-                    Some(Err(error)) => break Ending::Failed(format!("connection failed: {error}")),
-                    None => break Ending::Failed("connection lost".into()),
+                    Some(Err(error)) => {
+                        return (Ending::Failed(format!("connection failed: {error}")), None)
+                    }
+                    None => return (Ending::Failed("connection lost".into()), None),
                 }
             }
-            _ = ticker.tick() => {
-                if last_seen.elapsed() > timeout {
-                    break Ending::Failed(format!(
-                        "no message from the far end for {} s: heartbeat timeout",
-                        timeout.as_secs_f32()
-                    ));
-                }
-                if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
-                    break Ending::Failed("connection lost".into());
+        };
+        let silence = async {
+            loop {
+                let last_seen = *seen.borrow_and_update();
+                let Some(last_seen) = last_seen else {
+                    let _ = seen.changed().await;
+                    continue;
+                };
+                if tokio::time::timeout_at(last_seen + timeout, seen.changed())
+                    .await
+                    .is_err()
+                {
+                    return (
+                        Ending::Failed(format!(
+                            "no message from the far end for {} s: heartbeat timeout",
+                            timeout.as_secs_f32()
+                        )),
+                        None,
+                    );
                 }
             }
+        };
+        tokio::select! {
+            biased;
+            (code, reason) = shared.control.requested() => {
+                let close = close_frame(code, &reason);
+                (Ending::Failed(reason), Some(close))
+            }
+            ending = silence => ending,
+            ending = reader => ending,
+            ending = writer => ending,
         }
     };
+    // A writable peer still receives the appropriate close code. A stalled
+    // socket must not extend shutdown: poll once, then drop the physical IO.
+    if let Some(close) = close {
+        let _ = sink.send(close).now_or_never();
+    } else {
+        let _ = sink.flush().now_or_never();
+    }
     shared.outgoing.close(ending.clone());
     shared.incoming.close(ending);
 }
