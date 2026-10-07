@@ -122,15 +122,26 @@ def main() -> None:
         channel, endpoint, project = parse(sys.argv[1:])
     except ValueError as error:
         sys.exit(str(error))
+    exit_code = 0
     try:
         asyncio.run(run(channel, endpoint, project))
+    except SystemExit as error:
+        if error.code is not None:
+            if isinstance(error.code, int):
+                exit_code = error.code
+            else:
+                exit_code = 1
+                print(error.code, file=sys.stderr)
+    except BaseException as error:
+        exit_code = 130 if isinstance(error, KeyboardInterrupt) else 1
+        sys.excepthook(type(error), error, error.__traceback__)
     finally:
         # Stray plugin threads must not keep the process alive: rutis waits
         # for it to exit.
         sys.stdout.flush()
         sys.stderr.flush()
         logging.shutdown()
-        os._exit(0)
+        os._exit(exit_code)
 
 
 main()
